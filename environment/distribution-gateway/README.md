@@ -1,69 +1,74 @@
-# distribution-gateway
+# Distribution Gateway
 
-An Express service that publishes the current firmware code-signing key metadata
-and accepts CMS-signed release descriptors from the publisher.
+An Express service that exposes the active firmware code-signing key metadata and validates CMS-signed release descriptors from the release publisher.
 
-## Endpoints
+---
 
-- `GET /v1/signing-key/current` — returns the current signing-key metadata
-  (`key_id`, `algorithm`, `certificate_ref`, `status`). Clients read this to learn
-  which key and algorithm they must sign release descriptors with.
-- `POST /v1/publications` — accepts a JSON body:
+## HTTP API Endpoints
 
+### 1. Retrieve Active Signing Key
+- **Method / Path**: `GET /v1/signing-key/current`
+- **Response**:
   ```json
   {
-    "descriptor": "<canonical release descriptor>",
-    "signature": "<detached CMS signature, PEM>",
-    "request_token": "<client-supplied token>"
+    "key_id": "fw-signing-2026-current",
+    "algorithm": "RSA-SHA256",
+    "certificate_ref": "/app/keys/current/current.cert.pem",
+    "status": "ACTIVE"
+  }
+  ```
+- **Description**: Returns the active signing key identifier and certificate reference that clients must use to sign release descriptors.
+
+### 2. Submit Release Publication
+- **Method / Path**: `POST /v1/publications`
+- **Request Body**:
+  ```json
+  {
+    "descriptor": "<canonical release descriptor JSON string>",
+    "signature": "<detached OpenSSL CMS signature in PEM format>",
+    "request_token": "<client-supplied idempotency token>"
+  }
+  ```
+- **Success Response (HTTP 200/201)**:
+  ```json
+  {
+    "publication_id": "pub-BND-101",
+    "request_token": "token-BND-101",
+    "status": "PUBLISHED"
+  }
+  ```
+- **Rejection Response (HTTP 400)**:
+  ```json
+  {
+    "error": "UNTRUSTED_SIGNATURE",
+    "message": "Signature verification against current trust anchor failed."
   }
   ```
 
-  The gateway verifies the detached CMS signature over the exact descriptor bytes
-  it received against the current certificate. On success it records the
-  publication and returns a receipt `{ publication_id, request_token, status:
-  "PUBLISHED" }`. A descriptor signed with the revoked key does not verify against
-  the current certificate and is rejected with `{ "error": "UNTRUSTED_SIGNATURE" }`;
-  nothing is recorded in that case. Re-posting with a request token that was
-  already published replays the original receipt without creating a second
-  publication.
+---
 
-## Canonical release descriptor
+## Signature Verification
 
-The descriptor is UTF-8 JSON with lexicographically sorted object keys and no
-insignificant whitespace. The signer and the gateway must agree on these exact
-bytes. The gateway verifies the bytes it received verbatim; when a caller submits
-the descriptor as a structured object it is re-canonicalized the same way before
-verification.
+The distribution gateway validates detached signatures by executing OpenSSL CMS verification:
 
-## Signature verification
-
-Verification shells out to the OpenSSL CLI:
-
-```
-openssl cms -verify -inform PEM -in <sig.pem> -content <descriptor.bin> \
+```bash
+openssl cms -verify -inform PEM -in <signature.pem> -content <descriptor.bin> \
   -certfile $CURRENT_CERT_PATH -CAfile $CURRENT_CERT_PATH \
   -purpose any -no_check_time -binary
 ```
 
-The current certificate is self-signed, so it is both the signer-certificate
-source and the trust anchor. `CURRENT_CERT_PATH` defaults to
-`/app/keys/current/current.cert.pem` (the build-time install location) and is
-overridable so the gateway can run and be tested outside the container.
+- Because the active certificate is self-signed, it acts as both the signer certificate and the root trust anchor.
+- `CURRENT_CERT_PATH` defaults to `/app/keys/current/current.cert.pem` inside the container.
 
-## Persistence
+---
 
-Published bundles are recorded internally under `data/` (created at runtime),
-keyed by publication id and indexed by request token. This ledger is not exposed
-over HTTP; publication state is observable only through the endpoints above.
+## Local Service Execution & Tests
 
-## Running
+```bash
+# Start the gateway server (default port: 7070)
+node server.js
 
-```
-node server.js        # listens on port 7070 (override with PORT)
+# Run gateway test suite (Node >= 18)
+node --test tests/
 ```
 
-## Tests
-
-```
-node --test tests/    # requires Node >= 18; mints ephemeral keys via openssl
-```

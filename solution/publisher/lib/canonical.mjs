@@ -1,18 +1,22 @@
 /**
- * Serializes a JavaScript value into a canonical UTF-8 JSON string with
- * lexicographically sorted keys and no insignificant whitespace.
+ * Serializes data into a canonical UTF-8 JSON string with
+ * lexicographically sorted keys and no unnecessary whitespace.
  *
- * @param {any} value - Object, array, or primitive to encode.
- * @returns {string} Canonical JSON representation.
+ * @param {unknown} payload - Data structure or primitive to encode.
+ * @returns {string} Deterministic canonical JSON string.
  */
-export function canonicalEncode(value) {
-  if (Array.isArray(value)) {
-    return '[' + value.map(canonicalEncode).join(',') + ']';
+export function serializeCanonicalDescriptor(payload) {
+  if (Array.isArray(payload)) {
+    return '[' + payload.map(serializeCanonicalDescriptor).join(',') + ']';
   }
-  if (value !== null && typeof value === 'object') {
-    const keys = Object.keys(value).sort();
-    const entries = keys.map((k) => JSON.stringify(k) + ':' + canonicalEncode(value[k]));
-    return '{' + entries.join(',') + '}';
+
+  if (payload !== null && typeof payload === 'object') {
+    const sortedKeys = Object.keys(payload).sort();
+    const formattedPairs = sortedKeys.map(
+      (propertyKey) => JSON.stringify(propertyKey) + ':' + serializeCanonicalDescriptor(payload[propertyKey])
+    );
+    return '{' + formattedPairs.join(',') + '}';
   }
-  return JSON.stringify(value);
+
+  return JSON.stringify(payload);
 }

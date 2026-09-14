@@ -1,222 +1,133 @@
 # Candidate Guide — Firmware Release Publisher
 
-This is a walkthrough of the task, the environment, and a recommended order of
-work. It does **not** contain a solution — the design and code are yours to write.
-For the precise, binding requirements always defer to [instruction.md](instruction.md);
-this guide is the "how to approach it" companion.
+This document is a comprehensive guide to understanding the environment, requirements, and recommended engineering workflow for this challenge. It provides architectural context and debugging suggestions without prescribing exact implementation code. Always consult [instruction.md](instruction.md) for normative requirements.
 
 ---
 
-## 1. The goal
+## 1. Challenge Objectives
 
-Release engineering rotated the firmware **code-signing key**. Since the rotation,
-every release bundle the old publisher submits to the distribution gateway is
-rejected with `UNTRUSTED_SIGNATURE`, because bundles are still being signed with
-the now-revoked key.
+The release engineering team rotated the production firmware **code-signing key**. Following the rotation, the legacy publishing script failed because release payloads are still being signed with the revoked key, triggering `UNTRUSTED_SIGNATURE` rejections from the distribution gateway.
 
-Your job is to (re)write the publisher so that it:
+Your goal is to implement the replacement publisher to:
 
-1. reads the raw build manifest and **reconciles** it (removes withdrawn builds and
-   duplicate rows) using SQL in DuckDB;
-2. **signs** each publishable release bundle with the key that is *currently* in
-   force, using OpenSSL detached CMS signatures;
-3. **submits** each signed bundle to the provided Express distribution gateway over
-   HTTP;
-4. **records** the gateway's receipts and its own idempotency tokens in DuckDB so a
-   re-run does not double-publish; and
-5. prints **deterministic** status lines that reproduce a golden reference file.
+1. **Reconcile Data**: Ingest `/app/fixtures/build_manifest.csv` and filter cancelled builds and duplicate entries using DuckDB SQL.
+2. **Sign Descriptors**: Fetch the active key ID and sign canonical JSON descriptors with the current OpenSSL CMS keypair (`/app/keys/current/`).
+3. **Publish via HTTP**: Submit signed bundles to the Express gateway (`POST http://127.0.0.1:7070/v1/publications`).
+4. **Persist State**: Store receipts and deterministic idempotency tokens in `/app/releases.duckdb` so repeated runs do not duplicate publications.
+5. **Format Output**: Emit deterministic status lines to stdout matching `/app/reports/publications.expected.txt`.
 
-The one file you deliver is:
+### Deliverable Entry Point
 
-```
+```text
 /app/publisher/release-publisher.mjs
 ```
 
-It is run by the grader (and by you) via:
+Invoked via:
 
+```bash
+npm run report        # Executes: node /app/publisher/release-publisher.mjs --report
 ```
-npm run report        # = node publisher/release-publisher.mjs --report
-```
-
-### What this exercise assesses
-- SQL-based data reconciliation over an embedded database (DuckDB).
-- Correct use of a cryptographic CLI (OpenSSL CMS) and understanding of key
-  rotation / trust.
-- HTTP integration against a real service, including idempotency.
-- Local persistence and deterministic, reproducible output.
 
 ---
 
-## 2. The environment (what is given to you)
+## 2. Environment & Assets Overview
 
-Everything lives under `/app` inside the container:
+All components are located within `/app` inside the container:
 
-| Path | What it is |
-| --- | --- |
-| `fixtures/build_manifest.csv` | The raw input you must reconcile. |
-| `reports/publications.expected.txt` | The golden output your program must reproduce. |
-| `package.json` | Defines `npm run report` and the `duckdb` dependency (installed for you). |
-| `distribution-gateway/` | The provided Express service. **Do not modify it.** |
-| `keys/current/` | The signing keypair currently in force (`current.key.pem`, `current.cert.pem`). |
-| `keys/revoked/` | The old, rotated-out keypair. Signing with it fails — do not use it. |
-| `publisher/` | **Empty — this is where your `release-publisher.mjs` goes.** |
-
-You create `releases.duckdb` at run time; it is not pre-created.
-
-### The manifest schema
-
-```
-entry_id,bundle_id,component_id,version,size_bytes,record_type,supersedes_id,recorded_at
-```
-
-- `record_type` is `BUILD` or `WITHDRAWAL`.
-- A `WITHDRAWAL` row's `supersedes_id` is the `entry_id` of the `BUILD` it cancels.
-
-### The gateway contract
-
-Base URL `http://127.0.0.1:7070`.
-
-- `GET /v1/signing-key/current` → `{ key_id, algorithm, certificate_ref, status }`
-  — tells you which key id to report and which algorithm to sign with.
-- `POST /v1/publications` with
-  `{ descriptor, signature, request_token }` →
-  `{ publication_id, request_token, status: "PUBLISHED" }` on success, or
-  `{ error: "UNTRUSTED_SIGNATURE" }` if the signature doesn't verify against the
-  current certificate. Re-posting the same `request_token` replays the original
-  receipt (no duplicate is created).
-
-Read [distribution-gateway/README.md](environment/distribution-gateway/README.md)
-for the exact verification command and payload rules.
+| Path | Description |
+|---|---|
+| `fixtures/build_manifest.csv` | Raw manifest containing build and withdrawal records. |
+| `reports/publications.expected.txt` | Golden reference output format. |
+| `package.json` | Root npm package configuration with `duckdb` dependencies. |
+| `distribution-gateway/` | Provided Express distribution gateway (do not modify). |
+| `keys/current/` | Active signing keypair (`current.cert.pem`, `current.key.pem`). |
+| `keys/revoked/` | Revoked keypair (using these will cause verification failure). |
+| `publisher/` | Target location for your `release-publisher.mjs` script. |
 
 ---
 
-## 3. The reconciliation rules
+## 3. Reconciliation Logic
 
-Derive the set of **publishable bundles** with SQL:
+Derive valid bundles using DuckDB SQL:
 
-1. **Collapse exact duplicates.** Rows identical across *every* column are the same
-   record emitted twice — count them once.
-2. **Apply withdrawals.** A build referenced by a `WITHDRAWAL` (via `supersedes_id`)
-   is cancelled and is not part of any release.
-3. A bundle is **publishable** if, after 1 and 2, it still has at least one
-   surviving build. A bundle whose every build was withdrawn is skipped entirely.
-
-For each publishable bundle you'll also need the number of surviving builds and the
-sum of their `size_bytes` (these go into the signed descriptor).
+1. **Eliminate Duplicates**: Multiple raw rows with identical values in every column must be collapsed to a single entry.
+2. **Apply Withdrawals**: Any build entry whose `entry_id` appears as a `supersedes_id` in a `WITHDRAWAL` record must be removed.
+3. **Filter Empty Bundles**: If all builds belonging to a `bundle_id` are withdrawn, omit that bundle entirely.
+4. **Aggregate**: For each surviving bundle, calculate `artifact_count` (count of surviving builds) and `total_bytes` (sum of `size_bytes`).
 
 ---
 
-## 4. Recommended order of work
+## 4. Suggested Step-by-Step Implementation
 
-Work in small, testable increments rather than writing the whole pipeline at once.
+### Step 1: Environment Exploration
+Start the gateway in the background and verify connectivity:
 
-**Step 0 — Orient.**
-Read [instruction.md](instruction.md), skim the gateway `README.md`, and start the
-gateway in a second terminal so you can hit it while developing:
-
-```
-cd /app/distribution-gateway && node server.js
-# then, in another shell:
+```bash
+cd /app/distribution-gateway && node server.js &
 curl -s http://127.0.0.1:7070/healthz
 curl -s http://127.0.0.1:7070/v1/signing-key/current
 ```
 
-**Step 1 — Ingest + reconcile.**
-Load `fixtures/build_manifest.csv` into `releases.duckdb` and write the SQL that
-produces `(bundle_id, artifact_count, total_bytes)` for each publishable bundle.
-Print the rows and sanity-check them by hand against the CSV before moving on.
+### Step 2: Ingestion & Reconciliation
+Create a DuckDB database connection and write a SQL query against `/app/fixtures/build_manifest.csv` using Common Table Expressions (CTEs) to deduplicate and eliminate withdrawals. Verify your surviving row counts by inspection.
 
-**Step 2 — Prove signing works, in isolation.**
-Before wiring it into the program, confirm you can produce a signature the gateway
-accepts. Build one canonical descriptor string and sign it:
+### Step 3: Canonical Descriptors & OpenSSL CMS Signing
+Construct canonical JSON descriptors where keys are strictly sorted in lexicographical order:
 
+```json
+{"artifact_count":<count>,"bundle_id":"<id>","total_bytes":<bytes>}
 ```
-printf '%s' '{"artifact_count":1,"bundle_id":"BND-TEST","total_bytes":100}' > /tmp/d.bin
-openssl cms -sign -in /tmp/d.bin \
+
+Generate detached CMS signatures:
+
+```bash
+openssl cms -sign -in /tmp/descriptor.bin \
   -signer /app/keys/current/current.cert.pem \
-  -inkey  /app/keys/current/current.key.pem \
-  -outform PEM -binary > /tmp/sig.pem
+  -inkey /app/keys/current/current.key.pem \
+  -outform PEM -binary
 ```
 
-Then POST `{descriptor, signature, request_token}` and confirm you get
-`STATUS: PUBLISHED`. Try the same with the `keys/revoked/` key and confirm you get
-`UNTRUSTED_SIGNATURE` — this is the trap the task is built around.
+### Step 4: HTTP Submission & Local Persistence
+- Send POST requests with `{ descriptor, signature, request_token: "token-<bundle_id>" }`.
+- Persist returned `publication_id` and `status` in the `publications` table of `/app/releases.duckdb`.
+- Check DuckDB before issuing network requests to skip bundles that have already been published.
 
-> ⚠️ **Canonicalization matters.** The bytes you sign must be *exactly* the bytes
-> you send as `descriptor`. Use UTF-8 JSON with keys sorted lexicographically and
-> no extra whitespace. If the signed bytes and the sent bytes differ by even one
-> character, verification fails.
+### Step 5: Deterministic Output
+Format standard output lines:
 
-**Step 3 — Wire the loop.**
-For each publishable bundle (in ascending `bundle_id` order): build the descriptor,
-sign it, POST it, capture the receipt.
-
-**Step 4 — Persist + idempotency.**
-Store each `request_token`, its `publication_id`, and enough state in
-`releases.duckdb` that a second run reuses the stored receipts instead of
-re-submitting. Use the deterministic token `token-<bundle_id>`.
-
-**Step 5 — Deterministic output.**
-Emit exactly two lines per publishable bundle, ordered by `bundle_id`:
-
-```
+```text
 BUNDLE <bundle_id> SIGNED KEY=<key_id>
 BUNDLE <bundle_id> PUBLISHED RECEIPT=<publication_id> TOKEN=<request_token> STATUS=PUBLISHED
 ```
 
-`<key_id>` is whatever `GET /v1/signing-key/current` returns.
-
 ---
 
-## 5. How to check yourself
+## 5. Verification Techniques
 
-**Reproduce the golden output** (the grader masks only the random `RECEIPT` value):
+### Compare Against Golden Output
+Mask non-deterministic receipt IDs and compare against the expected report:
 
-```
-npm run report > /tmp/out.txt
+```bash
+npm run report > /tmp/output.txt
 diff <(sed -E 's/RECEIPT=[^ ]+/RECEIPT=<id>/' reports/publications.expected.txt) \
-     <(sed -E 's/RECEIPT=[^ ]+/RECEIPT=<id>/' /tmp/out.txt)
-# no diff  ->  output matches
+     <(sed -E 's/RECEIPT=[^ ]+/RECEIPT=<id>/' /tmp/output.txt)
 ```
 
-**Confirm idempotency** — run it twice; the output must be byte-identical and the
-gateway must still hold exactly one publication per bundle:
+### Check Idempotency
+Ensure consecutive runs emit identical stdout and perform no duplicate insertions:
 
-```
-npm run report > /tmp/a.txt
-npm run report > /tmp/b.txt
-diff /tmp/a.txt /tmp/b.txt        # must be empty
-```
-
-**Sanity-check the provided gateway** (it is already correct; useful if you suspect
-your own request shape):
-
-```
-cd /app/distribution-gateway && node --test tests/
+```bash
+npm run report > /tmp/run1.txt
+npm run report > /tmp/run2.txt
+diff /tmp/run1.txt /tmp/run2.txt
 ```
 
 ---
 
-## 6. Definition of done
+## 6. Key Boundaries & Failure Modes
 
-- `npm run report` reproduces `reports/publications.expected.txt` (receipt masked),
-  in the right order.
-- The reconciled, publishable bundle set is correct (fully-withdrawn bundles and
-  duplicate rows handled).
-- Every submission is `PUBLISHED` — nothing is `UNTRUSTED_SIGNATURE` (you signed
-  with the current key).
-- `releases.duckdb` contains the receipts and request tokens you used.
-- Re-running produces identical output and no duplicate publications on the gateway.
+- **Network-only Gateway Interaction**: Do not attempt to inspect or write directly to gateway ledger files under `distribution-gateway/data/`.
+- **No Revoked Keys**: Ensure you are signing exclusively with `/app/keys/current/`.
+- **Dynamic Derivation**: Do not hardcode bundle metrics or golden output strings.
+- **Ordered Output**: Always process and display bundles in ascending `bundle_id` order.
 
----
-
-## 7. Boundaries (things that will fail you)
-
-- Interact with the gateway **only over HTTP**. Do not read or write its private
-  ledger at `distribution-gateway/data/gateway.json`.
-- Do **not** disable or bypass signature verification.
-- Do **not** sign with the revoked key.
-- Do **not** hardcode the golden text, receipt ids, or row counts — your program
-  must derive everything from the manifest, so it would still be correct if the
-  manifest changed.
-- Keep output ordering deterministic (sort by `bundle_id`).

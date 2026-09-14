@@ -2,36 +2,44 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { CURRENT_CERT_PATH, CURRENT_KEY_PATH } from './config.mjs';
+import { ACTIVE_SIGNING_CERT, ACTIVE_SIGNING_KEY } from './config.mjs';
 
 /**
- * Signs a canonical descriptor string using OpenSSL detached CMS with the specified keypair.
+ * Generates a detached OpenSSL CMS signature for canonical descriptor payload.
  *
- * @param {string} descriptorStr - Canonical JSON descriptor to sign.
- * @param {string} [certPath=CURRENT_CERT_PATH] - Path to X.509 signer certificate PEM.
- * @param {string} [keyPath=CURRENT_KEY_PATH] - Path to RSA private key PEM.
- * @returns {string} Detached PEM signature string.
+ * @param {string} payloadContent - Exact canonical JSON string to sign.
+ * @param {string} [certificatePath=ACTIVE_SIGNING_CERT] - Path to signer X.509 certificate.
+ * @param {string} [privateKeyPath=ACTIVE_SIGNING_KEY] - Path to private key PEM.
+ * @returns {string} Formatted PEM detached signature.
  */
-export function signDescriptor(descriptorStr, certPath = CURRENT_CERT_PATH, keyPath = CURRENT_KEY_PATH) {
-  const scratch = fs.mkdtempSync(path.join(os.tmpdir(), 'signer-'));
-  const descFile = path.join(scratch, 'descriptor.bin');
+export function generateDetachedCmsSignature(
+  payloadContent,
+  certificatePath = ACTIVE_SIGNING_CERT,
+  privateKeyPath = ACTIVE_SIGNING_KEY
+) {
+  const temporaryWorkspace = fs.mkdtempSync(path.join(os.tmpdir(), 'cms-signer-'));
+  const inputBinaryFile = path.join(temporaryWorkspace, 'payload.bin');
+
   try {
-    fs.writeFileSync(descFile, Buffer.from(descriptorStr, 'utf8'));
-    const sigPem = execFileSync(
+    fs.writeFileSync(inputBinaryFile, Buffer.from(payloadContent, 'utf8'));
+
+    const opensslOutput = execFileSync(
       'openssl',
       [
         'cms',
         '-sign',
-        '-in', descFile,
-        '-signer', certPath,
-        '-inkey', keyPath,
+        '-in', inputBinaryFile,
+        '-signer', certificatePath,
+        '-inkey', privateKeyPath,
         '-outform', 'PEM',
         '-binary',
       ],
       { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }
     );
-    return sigPem.trim();
+
+    return opensslOutput.trim();
   } finally {
-    fs.rmSync(scratch, { recursive: true, force: true });
+    fs.rmSync(temporaryWorkspace, { recursive: true, force: true });
   }
 }
+

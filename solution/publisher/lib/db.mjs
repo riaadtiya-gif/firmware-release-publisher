@@ -1,32 +1,32 @@
 import duckdb from 'duckdb';
-import { DB_PATH, MANIFEST_PATH } from './config.mjs';
+import { RELEASES_DB_PATH, BUILD_MANIFEST_PATH } from './config.mjs';
 
 /**
- * Wraps DuckDB query execution in a Promise returning all result rows.
+ * Executes a SQL query against the DuckDB instance and resolves all matching rows.
  *
- * @param {duckdb.Database} db
- * @param {string} sql
+ * @param {duckdb.Database} databaseInstance
+ * @param {string} sqlQuery
  * @returns {Promise<any[]>}
  */
-export function query(db, sql) {
+export function executeSqlQuery(databaseInstance, sqlQuery) {
   return new Promise((resolve, reject) => {
-    db.all(sql, (err, rows) => {
+    databaseInstance.all(sqlQuery, (err, resultRows) => {
       if (err) return reject(err);
-      resolve(rows);
+      resolve(resultRows);
     });
   });
 }
 
 /**
- * Wraps DuckDB statement execution in a Promise.
+ * Executes a SQL statement (DDL/DML) against DuckDB.
  *
- * @param {duckdb.Database} db
- * @param {string} sql
+ * @param {duckdb.Database} databaseInstance
+ * @param {string} sqlStatement
  * @returns {Promise<void>}
  */
-export function exec(db, sql) {
+export function executeSqlCommand(databaseInstance, sqlStatement) {
   return new Promise((resolve, reject) => {
-    db.run(sql, (err) => {
+    databaseInstance.run(sqlStatement, (err) => {
       if (err) return reject(err);
       resolve();
     });
@@ -34,15 +34,15 @@ export function exec(db, sql) {
 }
 
 /**
- * Initializes the DuckDB database connection and creates required schema tables.
+ * Initializes the DuckDB database and ensures the publications receipt table exists.
  *
- * @param {string} [dbPath=DB_PATH]
+ * @param {string} [databasePath=RELEASES_DB_PATH]
  * @returns {Promise<duckdb.Database>}
  */
-export async function initDatabase(dbPath = DB_PATH) {
-  const db = new duckdb.Database(dbPath);
-  await exec(
-    db,
+export async function initializeReleasesDb(databasePath = RELEASES_DB_PATH) {
+  const dbConnection = new duckdb.Database(databasePath);
+  await executeSqlCommand(
+    dbConnection,
     `CREATE TABLE IF NOT EXISTS publications (
       bundle_id VARCHAR PRIMARY KEY,
       request_token VARCHAR,
@@ -51,79 +51,80 @@ export async function initDatabase(dbPath = DB_PATH) {
       published_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
     );`
   );
-  return db;
+  return dbConnection;
 }
 
 /**
- * Reconciles raw manifest CSV entries in DuckDB:
- * - Deduplicates exact duplicate records
- * - Applies withdrawals to cancel matching builds
- * - Aggregates artifact counts and total byte sizes for surviving bundles
+ * Ingests and reconciles the build manifest CSV:
+ * - Eliminates duplicate raw records across all attributes
+ * - Applies withdrawal notices to cancel superseded builds
+ * - Aggregates artifact counts and total file sizes for surviving bundles
  *
- * @param {duckdb.Database} db
- * @param {string} [manifestPath=MANIFEST_PATH]
+ * @param {duckdb.Database} dbConnection
+ * @param {string} [manifestCsvPath=BUILD_MANIFEST_PATH]
  * @returns {Promise<Array<{bundle_id: string, artifact_count: number, total_bytes: number}>>}
  */
-export async function reconcileManifest(db, manifestPath = MANIFEST_PATH) {
-  const rows = await query(
-    db,
-    `WITH raw AS (
-      SELECT * FROM read_csv_auto('${manifestPath}')
+export async function reconcileBuildManifest(dbConnection, manifestCsvPath = BUILD_MANIFEST_PATH) {
+  const reconciledResults = await executeSqlQuery(
+    dbConnection,
+    `WITH raw_manifest AS (
+      SELECT * FROM read_csv_auto('${manifestCsvPath}')
     ),
-    deduped AS (
-      SELECT DISTINCT * FROM raw
+    deduped_records AS (
+      SELECT DISTINCT * FROM raw_manifest
     ),
-    withdrawals AS (
+    withdrawn_entries AS (
       SELECT supersedes_id
-      FROM deduped
+      FROM deduped_records
       WHERE record_type = 'WITHDRAWAL' AND supersedes_id IS NOT NULL
     ),
-    surviving_builds AS (
+    active_builds AS (
       SELECT *
-      FROM deduped
+      FROM deduped_records
       WHERE record_type = 'BUILD'
-        AND entry_id NOT IN (SELECT supersedes_id FROM withdrawals)
+        AND entry_id NOT IN (SELECT supersedes_id FROM withdrawn_entries)
     )
     SELECT
       bundle_id,
       COUNT(*)::INTEGER AS artifact_count,
       SUM(size_bytes)::BIGINT AS total_bytes
-    FROM surviving_builds
+    FROM active_builds
     GROUP BY bundle_id
     ORDER BY bundle_id ASC;`
   );
-  return rows;
+  return reconciledResults;
 }
 
 /**
- * Retrieves an existing publication receipt from DuckDB for idempotency check.
+ * Looks up a previous publication receipt by bundle ID for idempotent execution.
  *
- * @param {duckdb.Database} db
+ * @param {duckdb.Database} dbConnection
  * @param {string} bundleId
  * @returns {Promise<{publication_id: string, request_token: string, status: string} | null>}
  */
-export async function getExistingPublication(db, bundleId) {
-  const rows = await query(
-    db,
+export async function findStoredPublication(dbConnection, bundleId) {
+  const matchingRows = await executeSqlQuery(
+    dbConnection,
     `SELECT publication_id, request_token, status FROM publications WHERE bundle_id = '${bundleId}';`
   );
-  return rows.length > 0 ? rows[0] : null;
+  return matchingRows.length > 0 ? matchingRows[0] : null;
 }
 
 /**
- * Stores a new publication receipt in DuckDB.
+ * Persists a new publication receipt record in DuckDB.
  *
- * @param {duckdb.Database} db
+ * @param {duckdb.Database} dbConnection
  * @param {string} bundleId
  * @param {string} requestToken
  * @param {string} publicationId
  * @param {string} status
  * @returns {Promise<void>}
  */
-export async function savePublication(db, bundleId, requestToken, publicationId, status) {
-  await exec(
-    db,
+export async function persistPublicationReceipt(dbConnection, bundleId, requestToken, publicationId, status) {
+  await executeSqlCommand(
+    dbConnection,
     `INSERT INTO publications (bundle_id, request_token, publication_id, status)
      VALUES ('${bundleId}', '${requestToken}', '${publicationId}', '${status}');`
   );
 }
+

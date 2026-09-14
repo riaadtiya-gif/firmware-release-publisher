@@ -1,67 +1,99 @@
 # Firmware Release Publisher
 
-A Docker-based firmware release publishing utility that uses DuckDB for release data and OpenSSL CMS for detached signatures. The publisher is designed to safely handle repeated runs without creating duplicate publications.
+An automated, cryptographically secure firmware release publishing utility. It leverages embedded DuckDB SQL for manifest data reconciliation and OpenSSL CMS for generating detached digital signatures against an active distribution gateway.
 
-## Getting Started
+---
 
-### Build the Environment
+## Architecture Overview
 
-Build the Docker image from the provided environment:
+```
++---------------------------------------------------------------------------------+
+|                                Docker Container                                 |
+|                                                                                 |
+|  +--------------------+        +-------------------+       +-----------------+  |
+|  | Build Manifest CSV | =====> |  Embedded DuckDB  | ====> | Reconciled Data |  |
+|  | (Raw build log)    |        | (releases.duckdb) |       | (surviving bnds)|  |
+|  +--------------------+        +-------------------+       +-----------------+  |
+|                                                                     ||          |
+|                                                                     \/          |
+|  +--------------------+        +-------------------+       +-----------------+  |
+|  | Express Gateway    | <===== | Detached OpenSSL  | <==== | Canonical JSON  |  |
+|  | (POST/v1/publish)  |        | CMS Signature     |       | Descriptor      |  |
+|  +--------------------+        +-------------------+       +-----------------+  |
++---------------------------------------------------------------------------------+
+```
+
+---
+
+## Quick Start
+
+> **Important**: Always ensure commands are executed from the `firmware-release-publisher` project root directory so volume mounts resolve to the intended paths.
+
+### 1. Build Container Image
+
+Build the evaluation container image from the environment definition:
 
 ```bash
 docker build -t firmware-publisher environment/
 ```
 
-### Run the Publisher
+### 2. Generate Release Publication Report
 
-To generate the release report, run:
+Execute the automated report runner:
 
 ```bash
 ./run_report.sh
 ```
 
-You can also execute it directly inside the Docker environment:
+Or run interactively inside the container:
 
 ```bash
-docker run --rm -v "$(pwd)/solution:/solution:ro" firmware-publisher bash -c '
-  cd /app/distribution-gateway && node server.js >/dev/null 2>&1 &
-  sleep 1
-  bash /solution/publish.sh >/dev/null 2>&1
-  npm run --silent report
-'
+docker run --rm \
+  -v "$(pwd)/solution:/solution:ro" \
+  firmware-publisher bash -c '
+    cd /app/distribution-gateway && node server.js >/dev/null 2>&1 &
+    sleep 1
+    bash /solution/publish.sh >/dev/null 2>&1
+    npm run --silent report
+  '
 ```
 
-The command starts the local distribution gateway, installs the reference publisher, and then runs the report command.
+### 3. Run Grader Evaluation
 
-### Run the Evaluation Tests
-
-The following command runs both the empty-environment check and the reference-solution verification:
+Run the automated baseline and reference verification suite:
 
 ```bash
 docker run --rm \
   -v "$(pwd)/solution:/solution:ro" \
   -v "$(pwd)/tests:/tests:ro" \
   firmware-publisher bash -c '
-    echo "=== Empty Environment Check ==="
+    echo "=== 1. Testing Empty Baseline (Must Score 0) ==="
     bash /tests/test.sh || true
     echo "Reward: $(cat /logs/verifier/reward.txt)"
 
-    echo "=== Installing Reference Solution ==="
+    echo "=== 2. Deploying Solution ==="
     bash /solution/publish.sh
 
-    echo "=== Running Reference Verification ==="
+    echo "=== 3. Testing Solution (Must Score 1) ==="
     bash /tests/test.sh
     echo "Reward: $(cat /logs/verifier/reward.txt)"
   '
 ```
 
-The first run is expected to produce a score of `0` because no publisher is installed. After the reference solution is deployed, the tests should complete successfully with a score of `1`.
+- **Empty Baseline**: Fails with `Reward: 0` because no publisher is installed.
+- **Reference Solution**: Passes all assertions with `Reward: 1`.
 
-## Project Layout
+---
 
-```text
-instruction.md       Task requirements given to the solver
-solution/            Reference implementation
-tests/               Automated verification and grading
-environment/         Docker image, fixtures, gateway, and runtime setup
-```
+## Directory Structure
+
+| Path | Purpose |
+|---|---|
+| `instruction.md` | Core specification and engineering constraints for the solver |
+| `CANDIDATE_GUIDE.md` | Practical step-by-step implementation guide |
+| `AUTHOR_NOTES.md` | Architectural background, trap mechanisms, and verification proofs |
+| `solution/` | Reference publisher implementation and deployment script |
+| `tests/` | Pytest verification suite and CTRF reward recorder |
+| `environment/` | Dockerfile, Express distribution gateway, fixtures, and golden reports |
+| `task.toml` | Task configuration metadata and runtime resource limits |
+
