@@ -1,54 +1,100 @@
-# Author Notes
+# Author Notes — Firmware Release Publisher
 
-## Task Overview
+## 1. Task Overview & Engineering Context
+This benchmark evaluates an AI coding agent's ability to handle a real-world infrastructure failure: a cryptographic key rotation breakdown. 
 
-This task evaluates a firmware release publisher that:
+Release engineering rotated the firmware code-signing key. The publisher pipeline broke because release bundles were still being signed with the now-revoked private key, causing the Express distribution gateway to reject every submission with `UNTRUSTED_SIGNATURE`.
 
-* Reads and reconciles firmware build data.
-* Groups valid builds into release bundles.
-* Creates a deterministic release descriptor.
-* Signs the descriptor using the current signing key.
-* Publishes releases through the distribution gateway.
-* Stores publication receipts in DuckDB.
-* Prevents duplicate publications on repeated runs.
+The solver must implement a production-grade publisher (`/app/publisher/release-publisher.mjs`) that:
+1. Reconciles raw manifest records from `fixtures/build_manifest.csv` into an embedded DuckDB database (`releases.duckdb`) using SQL.
+2. Formats canonical release descriptors and signs each surviving bundle with the active OpenSSL CMS private key (`/app/keys/current/current.key.pem`).
+3. Submits signed payloads to the distribution gateway (`POST /v1/publications`) and saves the receipt and token in DuckDB for idempotency.
+4. Prints deterministic status lines matching `reports/publications.expected.txt` when invoked via `npm run report`.
 
-## Key Requirements
+---
 
-* Withdrawn builds must be excluded.
-* Descriptor serialization must be deterministic.
-* The descriptor must be cryptographically signed.
-* Each bundle uses a deterministic request token.
-* Existing publications must be reused.
-* Repeated execution must produce the same result.
+## 2. Intentional Traps & Evaluation Rationale
 
-## Evaluation
+This task is designed to be cheat-resistant, punishing naive or incomplete solutions while rewarding correct systems engineering:
 
-The automated tests verify:
+### Trap 1: Key Rotation & Trust Anchor Verification
+* **Trap:** A naive script might use hardcoded key paths or the deprecated key under `/app/keys/revoked/`.
+* **Mechanism:** The distribution gateway executes `openssl cms -verify` against `/app/keys/current/current.cert.pem`. Descriptors signed with the revoked key are rejected with HTTP 400 (`UNTRUSTED_SIGNATURE`).
+* **Requirement:** The solver must query `GET /v1/signing-key/current` and sign exclusively with `/app/keys/current/`.
 
-* Expected bundles and artifact totals.
-* Correct signing key.
-* Successful gateway publication.
-* Database records and receipts.
-* Idempotent repeated execution.
+### Trap 2: Build Withdrawals & Empty Bundles
+* **Trap:** Summing all rows or ignoring `WITHDRAWAL` records.
+* **Mechanism:** In `fixtures/build_manifest.csv`, records with `record_type = 'WITHDRAWAL'` cancel previous `BUILD` records via `supersedes_id`. For bundle `BND-104`, all associated builds (`MFR-0020` and `MFR-0021`) are withdrawn.
+* **Requirement:** The solver must exclude cancelled builds and omit bundles with zero surviving builds (`BND-104`) entirely.
 
-## 0 → 1 Proof
+### Trap 3: Manifest Duplicate Ingestion
+* **Trap:** Calculating artifact count and byte size without deduplicating raw rows.
+* **Mechanism:** Multiple identical rows exist in `build_manifest.csv` (e.g. identical `MFR-0001`, `MFR-0007`, `MFR-0014` entries).
+* **Requirement:** Deduplication across all columns must be performed in SQL before aggregating artifact count and total bytes.
 
-### Proof A — Empty Baseline
+### Trap 4: Canonical JSON Descriptor Encoding
+* **Trap:** Using standard `JSON.stringify()` without key ordering.
+* **Mechanism:** The gateway verifies detached signatures over the exact byte sequence received. If JSON keys are not lexicographically sorted (`artifact_count`, `bundle_id`, `total_bytes`) or contain insignificant whitespace, verification fails.
+* **Requirement:** The solver must produce canonical UTF-8 JSON representations.
 
-The publisher was left empty and the tests were executed before deploying the reference solution.
+---
 
-* Result: Tests failed as expected.
-* Reward: `0`
+## 3. Idempotency & Persistence Design
+* Each release submission uses a deterministic request token formatted as `token-<bundle_id>`.
+* The publisher records `(bundle_id, request_token, publication_id, status)` in a `publications` table in `releases.duckdb`.
+* On successive runs, the publisher verifies local persistence first, preventing redundant HTTP requests and ensuring 100% deterministic output across re-runs.
 
-### Proof B — Reference Solution
+---
 
-The reference solution was deployed and the same test suite was executed.
+## 4. Verification & The Two Proofs
 
-* Result: `10 passed`
-* Reward: `1`
+The task was verified inside a clean container built from `environment/Dockerfile`.
 
-This confirms the task has a working 0 → 1 evaluation path.
+### Proof A: Empty Baseline Run (Reward: 0)
+With no solution installed, all verifier tests fail, writing `0` to `/logs/verifier/reward.txt`:
 
-## Final Environment
+```text
+=== 1. Testing Empty Baseline (Must Score 0) ===
+============================= test session starts ==============================
+platform linux -- Python 3.11.2, pytest-8.4.1, pluggy-1.6.0
+rootdir: /tests
+plugins: json-ctrf-0.3.5
+collected 4 items
 
-The final `environment/` does not contain the publisher implementation. The solver must implement `/app/publisher/release-publisher.mjs` according to `instruction.md`.
+../tests/test_outputs.py FFFF                                            [100%]
+
+=================================== FAILURES ===================================
+FAILED ../tests/test_outputs.py::test_publisher_script_exists
+FAILED ../tests/test_outputs.py::test_report_matches_golden_output
+FAILED ../tests/test_outputs.py::test_duckdb_reconciliation_and_receipts
+FAILED ../tests/test_outputs.py::test_idempotency_on_rerun
+======================== 4 failed, 2 warnings in 1.79s =========================
+pytest exit code: 1
+Reward: 0
+```
+
+---
+
+### Proof B: Reference Solution Verification (Reward: 1)
+After deploying `solution/publish.sh`, all tests pass, producing the deterministic output and writing `1` to `/logs/verifier/reward.txt`:
+
+```text
+=== 2. Deploying Solution ===
+=== 3. Testing Solution (Must Score 1) ===
+============================= test session starts ==============================
+platform linux -- Python 3.11.2, pytest-8.4.1, pluggy-1.6.0
+rootdir: /
+plugins: json-ctrf-0.3.5
+collected 4 items
+
+../tests/test_outputs.py ....                                            [100%]
+
+==================================== PASSES ====================================
+PASSED ../tests/test_outputs.py::test_publisher_script_exists
+PASSED ../tests/test_outputs.py::test_report_matches_golden_output
+PASSED ../tests/test_outputs.py::test_duckdb_reconciliation_and_receipts
+PASSED ../tests/test_outputs.py::test_idempotency_on_rerun
+============================== 4 passed in 2.58s ===============================
+pytest exit code: 0
+Reward: 1
+```

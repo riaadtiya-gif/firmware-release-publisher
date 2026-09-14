@@ -1,58 +1,67 @@
-# Firmware Release Publishing Assessment
+# Firmware Release Publisher
 
-A Docker-based assessment for building a secure and idempotent firmware release publishing workflow with DuckDB, OpenSSL CMS signing, and an HTTP distribution gateway.
+A Docker-based firmware release publishing utility that uses DuckDB for release data and OpenSSL CMS for detached signatures. The publisher is designed to safely handle repeated runs without creating duplicate publications.
 
 ## Getting Started
 
-### Build the Assessment Image
+### Build the Environment
+
+Build the Docker image from the provided environment:
 
 ```bash
-docker build -t firmware-assessment environment/
+docker build -t firmware-publisher environment/
 ```
 
-### Execute the Publisher
+### Run the Publisher
+
+To generate the release report, run:
 
 ```bash
-docker run --rm \
-  -v "$(pwd)/solution:/solution:ro" \
-  firmware-assessment bash -c 'cd /app/distribution-gateway && node server.js >/dev/null 2>&1 & sleep 1; bash /solution/publish.sh'
+./run_report.sh
 ```
 
-### Generate the Release Report
+You can also execute it directly inside the Docker environment:
 
 ```bash
-docker run --rm \
-  -v "$(pwd)/solution:/solution:ro" \
-  firmware-assessment bash -c 'cd /app/distribution-gateway && node server.js >/dev/null 2>&1 & sleep 1; bash /solution/publish.sh; cd /app; npm run --silent report'
+docker run --rm -v "$(pwd)/solution:/solution:ro" firmware-publisher bash -c '
+  cd /app/distribution-gateway && node server.js >/dev/null 2>&1 &
+  sleep 1
+  bash /solution/publish.sh >/dev/null 2>&1
+  npm run --silent report
+'
 ```
 
-### Run Automated Tests
+The command starts the local distribution gateway, installs the reference publisher, and then runs the report command.
+
+### Run the Evaluation Tests
+
+The following command runs both the empty-environment check and the reference-solution verification:
 
 ```bash
 docker run --rm \
   -v "$(pwd)/solution:/solution:ro" \
   -v "$(pwd)/tests:/tests:ro" \
-  firmware-assessment bash -c '
-    cd /app/distribution-gateway
-    node server.js >/dev/null 2>&1 &
-    sleep 1
+  firmware-publisher bash -c '
+    echo "=== Empty Environment Check ==="
+    bash /tests/test.sh || true
+    echo "Reward: $(cat /logs/verifier/reward.txt)"
+
+    echo "=== Installing Reference Solution ==="
     bash /solution/publish.sh
+
+    echo "=== Running Reference Verification ==="
     bash /tests/test.sh
     echo "Reward: $(cat /logs/verifier/reward.txt)"
   '
 ```
 
-Expected result:
+The first run is expected to produce a score of `0` because no publisher is installed. After the reference solution is deployed, the tests should complete successfully with a score of `1`.
+
+## Project Layout
 
 ```text
-10 passed
-Reward: 1
+instruction.md       Task requirements given to the solver
+solution/            Reference implementation
+tests/               Automated verification and grading
+environment/         Docker image, fixtures, gateway, and runtime setup
 ```
-
-## Repository Layout
-
-* `instruction.md` — Assessment task and requirements.
-* `environment/` — Docker image, gateway, fixtures, and runtime dependencies.
-* `solution/` — Reference implementation.
-* `tests/` — Automated verification suite.
-* `AUTHOR_NOTES.md` — Assessment design and verification notes.
